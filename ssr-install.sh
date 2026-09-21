@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# ssr-install.sh —— Ubuntu 20.04 / 22.04 / 24.04 SSR 服务端一键安装 + 修复
+# ssr-install.sh —— Ubuntu / Debian / CentOS / RHEL / Rocky / AlmaLinux SSR 服务端一键安装 + 修复
 #
 # 为什么不用网上那些 hijk / ccat 系的一键脚本：
 #   它们装的是 shadowsocksr 3.2.2 的 Python 版，其中
@@ -13,11 +13,15 @@
 #        → 重写 systemd 单元为前台运行（报错能进 journal）→ 启动并实测验证 → 打印 ssr:// 链接。
 # 可重复执行：已装过的机器会跳过下载、保留现有配置作为默认值，等同于修复。
 #
+# 与老 CentOS 脚本的两处有意分歧（都不照抄，理由见 README）：
+#   1) 不修改 SELinux 状态（老脚本会把 enforcing 永久改成 permissive）；只检测并给出排查命令。
+#   2) 不为装 BBR 去升级内核 / 删除旧内核包（老脚本 yum remove kernel-3.*，有把机器搞崩的风险）。
+#
 # 非交互（给 CI / 批量用）：SSR_PORT SSR_PASS SSR_METHOD SSR_PROTOCOL SSR_OBFS 可覆盖交互输入。
 
 set -u
 
-VER="1.0.1"
+VER="1.1.0"
 D=/usr/local/shadowsocks
 CONF=/etc/shadowsocksR.json
 UNIT=/lib/systemd/system/shadowsocksR.service
@@ -66,53 +70,98 @@ PY
 ########## 0. 环境检查 ##########
 step "0. 环境检查"
 [ "$(id -u)" = 0 ] || die "请用 root 运行（sudo -i 后再执行）"
-command -v apt-get >/dev/null 2>&1 || die "不是基于 apt 的系统，本脚本只支持 Ubuntu/Debian"
+command -v systemctl >/dev/null 2>&1 || die "没有 systemctl：本脚本依赖 systemd（CentOS 6 及更早不支持）"
 if [ ! -t 0 ] && [ -z "${SSR_PORT:-}" ]; then
     die "请用 bash <(curl -Ls 链接) 的方式运行（不要 curl ... | bash，会打乱交互输入），或用 SSR_PORT/SSR_PASS/SSR_METHOD/SSR_PROTOCOL/SSR_OBFS 环境变量非交互执行"
 fi
-OS_NAME=$(grep -m1 '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d'"' -f2)
-OS_VER=$(grep -m1 '^VERSION=' /etc/os-release 2>/dev/null | cut -d'"' -f2)
+
+osrel() { grep -m1 "^$1=" /etc/os-release 2>/dev/null | cut -d'"' -f2; }
+OS_NAME=$(osrel PRETTY_NAME)
+OS_ID=$(osrel ID)
+OS_VERID=$(osrel VERSION_ID)
 say "系统：${OS_NAME:-未知}"
-case "${OS_VER:-}" in
-    20.04*|22.04*|24.04*) say "Ubuntu ${OS_VER%% *} —— 支持" ;;
-    *) say "[!] 未在 ${OS_NAME:-这个系统} 上验证过，继续但可能有问题" ;;
+
+if command -v apt-get >/dev/null 2>&1; then PM=apt
+elif command -v dnf >/dev/null 2>&1; then PM=dnf
+elif command -v yum >/dev/null 2>&1; then PM=yum
+else die "找不到 apt-get / dnf / yum，本脚本不支持这个发行版"
+fi
+EL_MAJ=""
+[ "$PM" = "apt" ] || EL_MAJ=${OS_VERID%%.*}
+say "包管理器：$PM${EL_MAJ:+（EL ${EL_MAJ}）}"
+
+case "${OS_ID:-unknown}" in
+    ubuntu|debian)
+        case "${OS_VERID:-}" in
+            20.04|22.04|24.04) say "Ubuntu ${OS_VERID} —— 支持" ;;
+            *) say "[!] 未在 ${OS_NAME:-该系统} 上实测过（已验证：Ubuntu 20.04/22.04/24.04，CentOS/Rocky/Alma 7/8/9），继续尝试" ;;
+        esac
+        ;;
+    centos|rhel|rocky|almalinux|fedora)
+        say "${OS_ID} ${OS_VERID} —— 支持"
+        if [ "${OS_ID:-}" = "centos" ] && [ "${EL_MAJ:-}" = "7" ]; then
+            say "  [!] CentOS 7 已停止维护，官方 yum 源可能已下线；装包失败时按 README 换 vault 源再重试"
+        fi
+        ;;
+    *) say "[!] 未识别的发行版（${OS_NAME:-未知}），按 $PM 继续尝试" ;;
 esac
 
 ########## 1. 安装依赖 ##########
-step "1. 安装依赖（逐个装，避免一个包名不存在就整条 apt 事务失败）"
-apt-get update -qq >/dev/null 2>&1
-apt_get() {
-    if apt-get install -y "$1" >/dev/null 2>&1; then
-        say "  + $1"
-    elif dpkg -s "$1" >/dev/null 2>&1; then
-        say "  = $1 已安装"
-    else
-        say "  - $1 装不上（稍后按提示处理）"
+step "1. 安装依赖（逐个装，避免一个包名找不到就整条事务全部不装）"
+pkg_upd() {
+    case "$PM" in
+        apt) apt-get update -qq >/dev/null 2>&1 ;;
+        dnf) dnf makecache -q >/dev/null 2>&1 ;;
+        yum) yum makecache fast >/dev/null 2>&1 || yum makecache >/dev/null 2>&1 ;;
+    esac
+}
+pkg_ins() {
+    case "$PM" in
+        apt) apt-get install -y "$1" >/dev/null 2>&1 ;;
+        dnf) dnf install -y "$1" >/dev/null 2>&1 ;;
+        yum) yum install -y "$1" >/dev/null 2>&1 ;;
+    esac
+}
+pkg_q() {
+    if [ "$PM" = "apt" ]; then dpkg -s "$1" >/dev/null 2>&1; else rpm -q "$1" >/dev/null 2>&1; fi
+}
+pkg() {
+    local p="$1"
+    if pkg_ins "$p"; then say "  + $p"
+    elif pkg_q "$p"; then say "  = $p 已安装"
+    else say "  - $p 装不上（稍后按提示处理）"
     fi
 }
-for p in python3 ca-certificates curl wget net-tools iproute2 qrencode unzip; do apt_get "$p"; done
+pkg_upd
+if [ "$PM" != "apt" ]; then
+    # EPEL 提供 EL 上的 libsodium / qrencode，以及 CentOS 7 的 python3
+    pkg epel-release
+    if ! rpm -q epel-release >/dev/null 2>&1; then
+        say "  [!] epel-release 包装不上，直接导入 EPEL rpm"
+        rpm -Uvh --replacepkgs "https://dl.fedoraproject.org/pub/epel/epel-release-latest-${EL_MAJ:-7}.noarch.rpm" \
+            >/dev/null 2>&1 && say "  + EPEL rpm 已导入" || say "  - EPEL 导入失败（libsodium/qrencode 可能装不上，不影响 aes-* 方案）"
+        pkg_upd
+    fi
+fi
+BASE_PKGS=(curl wget ca-certificates net-tools unzip tar openssl python3)
+if [ "$PM" = "apt" ]; then BASE_PKGS+=(iproute2 qrencode); else BASE_PKGS+=(iproute qrencode); fi
+for p in "${BASE_PKGS[@]}"; do pkg "$p"; done
 command -v python3 >/dev/null 2>&1 || die "没有 python3，SSR 的 Python 版跑不起来"
 PY=$(command -v python3)
-say "python3：$($PY -V 2>&1)"
+say "python3：$($PY -V 2>&1)（本脚本的内联 Python 只用 json/base64 基础 API，兼容 EL7 的 3.6）"
 
-SODIUM_CANDS=$($PY - <<'PY'
-import re, subprocess
-out = subprocess.run(['apt-cache', 'search', '--names-only', r'^libsodium\d+$'],
-                     capture_output=True, text=True).stdout
-ver = {}
-for line in out.splitlines():
-    fields = line.split()
-    m = re.fullmatch(r'libsodium(\d+)', fields[0]) if fields else None
-    if m:
-        ver[m.group(0)] = int(m.group(1))
-print('\n'.join(sorted(ver, key=lambda k: -ver[k])))
-PY
-)
+# libsodium：apt 侧探测当前系统真实包名（老脚本写死 libsodium18 是翻车点之一），EL 侧就叫 libsodium
+if [ "$PM" = "apt" ]; then
+    SODIUM_CANDS=$(apt-cache search --names-only '^libsodium[0-9]+$' 2>/dev/null | awk '{print $1}' \
+        | grep -xE 'libsodium[0-9]+' | sed 's/libsodium//' | sort -rn | sed 's/^/libsodium/')
+else
+    SODIUM_CANDS="libsodium"
+fi
 SODIUM=""
 for s in $SODIUM_CANDS; do
-    if apt-get install -y "$s" >/dev/null 2>&1; then say "  + $s"; SODIUM=$s; break; fi
+    if pkg_ins "$s"; then say "  + $s"; SODIUM=$s; break; fi
 done
-[ -n "$SODIUM" ] || say "  - 没装上任何 libsodium（不影响 aes-* 系列）"
+[ -n "$SODIUM" ] || say "  - 没装上 libsodium（不影响 aes-* 系列）"
 if ldconfig -p 2>/dev/null | grep -q 'libsodium\.so'; then
     say "libsodium 可用 ✓ （chacha20 / salsa20 系列可用）"
 else
@@ -124,19 +173,36 @@ step "2. 配置参数（回车即用默认值；老机器上默认值 = 现有�
 OLD_PORT=$(cfgget server_port); OLD_PASS=$(cfgget password)
 OLD_METHOD=$(cfgget method); OLD_PROTO=$(cfgget protocol); OLD_OBFS=$(cfgget obfs)
 
-PORT=${SSR_PORT:-${OLD_PORT:-$((RANDOM % 20000 + 30000))}}
-while ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1024 ] || [ "$PORT" -gt 65535 ]; do
-    read -r -p "   端口输入有误（需 1024-65535），请重输：" PORT
-done
-say "  端口：$PORT"
+ask_or_die() {   # ask_or_die "提示" 变量名 —— 读入并允许回车用默认值；stdin 不是终端时明确报错
+    local prompt="$1" __n="$2"
+    read -r -p "$prompt" "$__n" || die "读取输入失败：stdin 不是终端？请用 bash <(curl -Ls 链接) 的方式运行，或用 SSR_PORT/SSR_PASS 等环境变量非交互执行"
+}
 
-PASS=${SSR_PASS:-${OLD_PASS:-}}
-if [ -z "$PASS" ]; then
-    PASS=$(tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 16)
-    say "  密码：$PASS   （随机生成，请记牢）"
+DEF_PORT=${SSR_PORT:-${OLD_PORT:-$((RANDOM % 20000 + 30000))}}
+if [ -n "${SSR_PORT:-}" ]; then
+    PORT=$SSR_PORT
 else
-    say "  密码：沿用现有密码"
+    ask_or_die "   请输入端口（回车 = ${DEF_PORT}）：" PORT
+    PORT=${PORT:-$DEF_PORT}
 fi
+while ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; do
+    say "   输入错误，端口号为 1-65535 的数字"
+    ask_or_die "   请重输端口：" PORT
+    PORT=${PORT:-$DEF_PORT}
+done
+if [ "$PORT" -lt 1024 ]; then
+    say "   [!] ${PORT} 属于系统保留端口，若已被 ssh(22)/http(80) 等占用会启动失败，建议用 1024 以上"
+fi
+say "  端口号：$PORT"
+
+DEF_PASS=${SSR_PASS:-${OLD_PASS:-$(tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 16)}}
+if [ -n "${SSR_PASS:-}" ]; then
+    PASS=$SSR_PASS
+else
+    ask_or_die "   请输入密码（回车 = ${DEF_PASS}，直接回车用随机值）：" PASS
+    PASS=${PASS:-$DEF_PASS}
+fi
+say "  密码：$PASS"
 
 if [ -n "${SSR_METHOD:-}" ]; then METHOD=$SSR_METHOD
 else METHOD=$(pick "  加密方式：" "${OLD_METHOD:-aes-256-cfb}" "${METHODS[@]}"); fi
@@ -258,26 +324,54 @@ systemctl enable "$SVC" >/dev/null 2>&1
 systemctl restart "$SVC"
 sleep 3
 
-########## 8. 防火墙 ##########
+########## 8. 防火墙 / SELinux ##########
 step "8. 防火墙"
+FW_DONE=""
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: *active'; then
     ufw allow "${PORT}/tcp" >/dev/null 2>&1 && say "  ufw 已放行 ${PORT}/tcp"
     ufw allow "${PORT}/udp" >/dev/null 2>&1 && say "  ufw 已放行 ${PORT}/udp"
-else
-    say "  ufw 未启用，跳过"
+    FW_DONE=1
 fi
+if [ -z "$FW_DONE" ] && command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+    firewall-cmd --permanent --add-port="${PORT}/tcp" >/dev/null 2>&1
+    firewall-cmd --permanent --add-port="${PORT}/udp" >/dev/null 2>&1
+    firewall-cmd --reload >/dev/null 2>&1 && say "  firewalld 已永久放行 ${PORT}/tcp+udp"
+    say "  （老脚本会顺手 --add-service=http 把 80 也开了，这里不做）"
+    FW_DONE=1
+fi
+if [ -z "$FW_DONE" ] && command -v iptables >/dev/null 2>&1 \
+        && iptables -S INPUT 2>/dev/null | grep -q -- '-P INPUT DROP'; then
+    iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT >/dev/null 2>&1 \
+        && say "  iptables 已插入 ${PORT}/tcp ACCEPT（重启后失效，需自行持久化）"
+    iptables -I INPUT -p udp --dport "$PORT" -j ACCEPT >/dev/null 2>&1
+    FW_DONE=1
+fi
+[ -n "$FW_DONE" ] || say "  未检测到启用中的 ufw / firewalld / iptables，跳过系统层放行"
 say "  [!] 云服务器还要在控制台的安全组/防火墙里放行 ${PORT} 的 TCP 和 UDP，缺一不可"
+
+if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = "Enforcing" ]; then
+    say "  SELinux = Enforcing。本脚本不修改它（老 CentOS 脚本会永久改成 permissive，不建议）"
+    say "  若客户端连不上又查不出原因：ausearch -m avc -ts recent ；确认是被 SELinux 拦了再"
+    say "      setsebool -P nis_enabled 1        # 允许服务做出站/DNS，比关 SELinux 精确得多"
+fi
 
 ########## 9. BBR（可选加速） ##########
 step "9. BBR"
 if lsmod 2>/dev/null | grep -q '^tcp_bbr'; then
     say "  BBR 已启用"
 else
-    if ! grep -q '^net.core.default_qdisc=fq' /etc/sysctl.conf 2>/dev/null; then
-        printf 'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n' >> /etc/sysctl.conf
-        sysctl -p >/dev/null 2>&1
+    modprobe tcp_bbr >/dev/null 2>&1
+    if lsmod 2>/dev/null | grep -q '^tcp_bbr'; then
+        grep -q '^net.core.default_qdisc=fq' /etc/sysctl.conf 2>/dev/null || {
+            printf 'net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n' >> /etc/sysctl.conf
+            sysctl -p >/dev/null 2>&1
+        }
+        say "  BBR 已开启"
+    else
+        say "  内核没有 tcp_bbr（CentOS 7 自带的 3.10 内核需升到 4.9+ 才有）"
+        say "  本脚本不会为此升级内核或卸载旧内核包 —— 老脚本那步 yum remove kernel-3.* 有把机器搞到起不来的风险"
+        say "  不影响 SSR 正常使用，只是少了拥塞控制加速"
     fi
-    lsmod 2>/dev/null | grep -q '^tcp_bbr' && say "  BBR 已开启" || say "  内核无 tcp_bbr，跳过（不影响 SSR）"
 fi
 
 ########## 10. 实测验证 + 连接信息 ##########
@@ -288,6 +382,13 @@ LISTEN=$(ss -lntp 2>/dev/null | grep ":$PORT " || netstat -lntp 2>/dev/null | gr
 if [ -z "$LISTEN" ]; then
     say "  [!] 端口 $PORT 没有监听，最近日志："
     journalctl -u "$SVC" -n 25 --no-pager 2>/dev/null | sed 's/^/    /'
+    if command -v ausearch >/dev/null 2>&1; then
+        AVC=$(ausearch -m avc -ts recent 2>/dev/null | tail -n 5)
+        if [ -n "$AVC" ]; then
+            say "  上面没有明显报错的话，看这里 —— SELinux 最近的拒绝记录："
+            printf '%s\n' "$AVC" | sed 's/^/    /'
+        fi
+    fi
     die "启动失败，把上面的日志贴出来"
 fi
 printf '%s\n' "$LISTEN" | sed 's/^/  /'
