@@ -3,16 +3,33 @@
 在服务器上执行（**注意是 `bash <(...)`，不是 `curl | bash`**，否则会打乱交互输入）：
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/ssr-kit/main/ssr-install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/laoxiao666/ssr-kit/main/ssr-install.sh)
 ```
 
 改过脚本后 raw 链接有约 5 分钟缓存，加个参数破缓存：`...ssr-install.sh?v=2`。
+
+### raw 拉不下来时（`Connection reset`）
+
+`raw.githubusercontent.com` 会被间歇性重置，而 `github.com` / `codeload.github.com` 通常仍可达。任选一条：
+
+```bash
+# 1) 用 git clone（最稳，走 github.com）
+git clone --depth 1 https://github.com/laoxiao666/ssr-kit && bash ssr-kit/ssr-install.sh
+
+# 2) 走 GitHub API 取内容（raw 的等价替代，不依赖第三方）
+curl -sL https://api.github.com/repos/laoxiao666/ssr-kit/contents/ssr-install.sh \
+  | python3 -c "import json,base64,sys;sys.stdout.buffer.write(base64.b64decode(json.load(sys.stdin)['content']).decode('utf-8').encode('utf-8'))" \
+  > /root/ssr-install.sh && bash /root/ssr-install.sh
+
+# 3) jsDelivr CDN（国内可达性好；但把第三方放进了信任链，且 @main 有缓存，重要变更前请核对内容）
+bash <(curl -Ls https://cdn.jsdelivr.net/gh/laoxiao666/ssr-kit@main/ssr-install.sh)
+```
 
 非交互执行（批量装机）：
 
 ```bash
 SSR_PORT=38880 SSR_PASS=xxxx SSR_METHOD=aes-256-cfb SSR_PROTOCOL=auth_chain_a SSR_OBFS=tls1.2_ticket_auth \
-  bash <(curl -Ls https://raw.githubusercontent.com/你的用户名/ssr-kit/main/ssr-install.sh)
+  bash <(curl -Ls https://raw.githubusercontent.com/laoxiao666/ssr-kit/main/ssr-install.sh)
 ```
 
 脚本是幂等的：重复执行会跳过下载、把现有配置的端口/密码/加密方式作为默认值，等同于"修复 + 改配置"。

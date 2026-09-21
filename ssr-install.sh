@@ -17,7 +17,7 @@
 
 set -u
 
-VER="1.0.0"
+VER="1.0.1"
 D=/usr/local/shadowsocks
 CONF=/etc/shadowsocksR.json
 UNIT=/lib/systemd/system/shadowsocksR.service
@@ -28,9 +28,9 @@ METHODS=(aes-256-cfb aes-192-cfb aes-128-cfb aes-256-ctr aes-192-ctr aes-128-ctr
 PROTOCOLS=(origin verify_deflate auth_sha1_v4 auth_aes128_md5 auth_aes128_sha1 auth_chain_a auth_chain_b auth_chain_c auth_chain_d auth_chain_e auth_chain_f)
 OBFSLIST=(plain http_simple http_post tls1.2_ticket_auth tls1.2_ticket_fastauth)
 
-say()  { printf '%s\n' "$*"; }
-step() { printf '\n########## %s ##########\n' "$*"; }
-die()  { printf '\n[!] %s\n' "$*" >&2; exit 1; }
+say()  { printf '%s\n' "${*:-}"; }
+step() { printf '\n########## %s ##########\n' "${*:-}"; }
+die()  { printf '\n[!] %s\n' "${*:-}" >&2; exit 1; }
 
 # 菜单：选项和提示走 stderr，选定的值走 stdout，方便命令替换
 pick() {
@@ -70,11 +70,12 @@ command -v apt-get >/dev/null 2>&1 || die "不是基于 apt 的系统，本脚�
 if [ ! -t 0 ] && [ -z "${SSR_PORT:-}" ]; then
     die "请用 bash <(curl -Ls 链接) 的方式运行（不要 curl ... | bash，会打乱交互输入），或用 SSR_PORT/SSR_PASS/SSR_METHOD/SSR_PROTOCOL/SSR_OBFS 环境变量非交互执行"
 fi
-UBUNTU=$(. /etc/os-release 2>/dev/null; echo "${VERSION:-unknown}")
-say "系统：$PRETTY_NAME"
-case "$UBUNTU" in
-    20.04*|22.04*|24.04*) say "Ubuntu $UBUNTU —— 支持" ;;
-    *) say "[!] 未在 Ubuntu $UBUNTU 上验证过，继续但可能有问题" ;;
+OS_NAME=$(grep -m1 '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d'"' -f2)
+OS_VER=$(grep -m1 '^VERSION=' /etc/os-release 2>/dev/null | cut -d'"' -f2)
+say "系统：${OS_NAME:-未知}"
+case "${OS_VER:-}" in
+    20.04*|22.04*|24.04*) say "Ubuntu ${OS_VER%% *} —— 支持" ;;
+    *) say "[!] 未在 ${OS_NAME:-这个系统} 上验证过，继续但可能有问题" ;;
 esac
 
 ########## 1. 安装依赖 ##########
@@ -297,7 +298,7 @@ IP=$(curl -sL -m 12 -4 ip.sb 2>/dev/null | grep -E '^[0-9.]+$')
 B64PASS=$(printf '%s' "$PASS" | base64 -w 0 | tr -d '=')
 LINK=$(printf '%s' "$IP:$PORT:$PROTO:$METHOD:$OBFS:$B64PASS/?remarks=ssr&protoparam=&obfsparam=" | base64 -w 0 | tr -d '=')
 
-say
+say ""
 say "============================================"
 say " SSR 已运行   (ssr-install v$VER)"
 say "   IP      : $IP"
